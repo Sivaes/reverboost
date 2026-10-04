@@ -67,9 +67,15 @@ jobs:
       - name: Apply the patch
         working-directory: src
         run: |
-          git apply --ignore-whitespace --check ../mod/patches/revert-boost.patch
-          if ($LASTEXITCODE -ne 0) { throw "patches/revert-boost.patch does not fit ReSkate $env:UPSTREAM_REF any more. ReSkate changed a file the patch edits; the patch needs updating for this version." }
-          git apply --ignore-whitespace ../mod/patches/revert-boost.patch
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'mod/patches/revert-boost.patch'
+          if (-not (Test-Path $patch)) {
+            Write-Host 'Files in this repository:'
+            Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'mod') -Recurse -File -Name | Where-Object { $_ -notlike '.git*' } | Select-Object -First 40
+            throw 'patches/revert-boost.patch is not in this repository. Upload the "patches" folder from the zip so the file is at patches/revert-boost.patch (a folder called patches at the top, holding revert-boost.patch).'
+          }
+          git apply --ignore-whitespace --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "The patch is there but does not fit ReSkate $env:UPSTREAM_REF. ReSkate changed a file the patch edits; the patch needs updating for this version." }
+          git apply --ignore-whitespace $patch
           if ($LASTEXITCODE -ne 0) { throw 'The patch failed to apply.' }
 
       - name: Configure
