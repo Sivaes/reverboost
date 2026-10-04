@@ -1,0 +1,156 @@
+diff -ruN pa/Extension/Skater/client_debug.cpp pb/Extension/Skater/client_debug.cpp
+--- pa/Extension/Skater/client_debug.cpp	2026-10-04 23:46:32.242279349 +0000
++++ pb/Extension/Skater/client_debug.cpp	2026-10-04 23:46:32.272326757 +0000
+@@ -13,6 +13,9 @@
+ #include "Extension/Profile/local_profile_runtime.h"
+ #include <algorithm>
+ #include <cmath>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
+ #include <format>
+ #include <optional>
+ #include <utility>
+@@ -140,6 +143,57 @@
+             fire ? ", BOOST" : unfinished ? (allowed ? ", no boost (not on ground / cooldown / speed)" : ", off") : "");
+ }
+ }
++// ---- Dark pop probe -----------------------------------------------------------
++// Off unless switched on. While on it writes logs\dark-pop-probe.csv beside the game: one row per tick
++// with the physics state, the controller buttons, 40 words of the skater's request block (where the game
++// keeps "mount", "dismount" and similar requests), 64 floats of the board's first body and the skater's
++// transform. Doing a few natural dark pops (and failures) with it on shows which of those values the
++// game changes at the moment a pop happens, which is what a faithful Dark Pop needs to know.
++namespace {
++std::ofstream& probe_file() { static auto* file = new std::ofstream; return *file; }
++void probe_tick(InteractiveDebug& debug, const std::array<float, 16>& transform, const NoclipBodies& bodies, bool ready) {
++    auto& file = probe_file();
++    if (!debug.probe || !ready) {
++        if (file.is_open()) file.close();
++        return;
++    }
++    if (!file.is_open()) {
++        wchar_t module[MAX_PATH]{};
++        const auto length = GetModuleFileNameW(nullptr, module, MAX_PATH);
++        if (!length || length >= MAX_PATH) { debug.probe = false; return; }
++        const auto path = std::filesystem::path(module).parent_path() / "logs" / "dark-pop-probe.csv";
++        std::error_code error;
++        std::filesystem::create_directories(path.parent_path(), error);
++        file.open(path, std::ios::out | std::ios::trunc);
++        if (!file) { debug.probe = false; return; }
++        file << "ms,state,pad";
++        for (int i = 0; i < 40; ++i) file << ",c" << i;
++        for (int i = 0; i < 64; ++i) file << ",b" << i;
++        for (int i = 0; i < 16; ++i) file << ",t" << i;
++        file << "\n";
++        logging::write(logging::Level::info, logging::Channel::skater, "Dark pop probe: writing logs\\dark-pop-probe.csv");
++    }
++    // Guarded same-process copies of larger blocks (value<T> is limited to 16 bytes).
++    SourceReader reader;
++    std::uint32_t state{};
++    std::array<std::uint32_t, 40> words{};
++    std::array<float, 64> board{};
++    source_require(reader.raw(bodies.context + 0x1414, &state, sizeof state) &&
++                   reader.raw(bodies.context + 0x13a0, words.data(), sizeof words) &&
++                   reader.raw(bodies.parts[0], board.data(), sizeof board),
++        "Dark pop probe: the skater's data could not be read.");
++    ControllerInput pad;
++    DingoSDKOverlayReadControllerInput(&pad);
++    char text[32];
++    file << GetTickCount64() << ',' << state << ',' << (pad.available ? pad.buttons : 0u);
++    for (const auto word : words) { std::snprintf(text, sizeof text, ",%x", word); file << text; }
++    for (const auto value : board) { std::snprintf(text, sizeof text, ",%.4g", static_cast<double>(value)); file << text; }
++    for (const auto value : transform) { std::snprintf(text, sizeof text, ",%.4g", static_cast<double>(value)); file << text; }
++    file << '\n';
++    static ULONGLONG last_flush = 0;
++    if (const auto now = GetTickCount64(); now - last_flush > 1000) { file.flush(); last_flush = now; }
++}
++}
+ std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model) {
+     SourceReader reader;
+     source_require(reader.pointer(client) == base + addr::engine::client_vtable, "Client changed.");
+@@ -513,6 +567,11 @@
+         debug.status = up ? "Up Boost speed updated." : "Forward Boost speed updated.";
+         return;
+     }
++    if (request.action == overlay::DebugAction::set_probe_enabled) {
++        debug.probe = request.enabled;
++        debug.status = request.enabled ? "Dark pop probe on: writing logs\\dark-pop-probe.csv." : "Dark pop probe off.";
++        return;
++    }
+     if (request.action == overlay::DebugAction::set_revert_boost_enabled) {
+         debug.revert_boost = request.enabled;
+         debug.revert_track = {};
+@@ -894,6 +953,8 @@
+         } else if (debug.up_velocity.valid) {
+             model.up_velocity_unavailable = "Up Boost is being applied.";
+         }
++        try { probe_tick(debug, skater_transform, bodies, can_control); }
++        catch (...) {}
+         try { revert_boost_tick(debug, client, model.skater_identity, skater_transform, bodies, can_control); }
+         catch (...) { debug.revert_track = {}; }
+         model.no_bail_available = can_control && update_no_bail(client, model.skater_identity, debug.no_bail && no_bail_allowed,
+@@ -946,6 +1007,7 @@
+     model.forward_velocity_updates = debug.forward_velocity_updates;
+     model.up_velocity_speed = debug.up_velocity_speed;
+     model.up_velocity_updates = debug.up_velocity_updates;
++    model.probe = debug.probe;
+     model.revert_boost = debug.revert_boost;
+     model.revert_boost_speed = debug.revert_boost_speed;
+     model.revert_boost_count = debug.revert_boost_count;
+diff -ruN pa/Extension/Skater/client_source_spawn_internal.h pb/Extension/Skater/client_source_spawn_internal.h
+--- pa/Extension/Skater/client_source_spawn_internal.h	2026-10-04 23:46:32.241922909 +0000
++++ pb/Extension/Skater/client_source_spawn_internal.h	2026-10-04 23:46:32.271980460 +0000
+@@ -135,6 +135,7 @@
+     bool revert_boost{};
+     float revert_boost_speed = 2.0f; // metres per second added along the direction of travel
+     std::uint64_t revert_boost_count{};
++    bool probe{}; // see probe_tick in client_debug.cpp
+     struct RevertTrack {
+         bool airborne{};
+         float yaw{}, spin{}; // radians: last facing, and the turn accumulated this jump
+diff -ruN pa/Extension/UI/Overlay/overlay.h pb/Extension/UI/Overlay/overlay.h
+--- pa/Extension/UI/Overlay/overlay.h	2026-10-04 23:46:32.243685060 +0000
++++ pb/Extension/UI/Overlay/overlay.h	2026-10-04 23:46:32.273524599 +0000
+@@ -69,6 +69,7 @@
+     set_free_camera_fov,  // 0 = the game's own FOV
+     set_revert_boost_enabled,
+     set_revert_boost_speed,
++    set_probe_enabled,
+     // Keep the last action in sync with the bound in request_scheduler.h.
+ };
+ 
+@@ -120,6 +121,7 @@
+     bool revert_boost = false;
+     float revert_boost_speed = 2.0f;
+     std::uint64_t revert_boost_count = 0;
++    bool probe = false; // Dark pop probe: writes logs\dark-pop-probe.csv
+     bool camera_position_valid = false;
+     bool skater_position_valid = false;
+     std::array<float, 3> camera_position{};
+diff -ruN pa/Extension/UI/Overlay/skate_menu_skater.cpp pb/Extension/UI/Overlay/skate_menu_skater.cpp
+--- pa/Extension/UI/Overlay/skate_menu_skater.cpp	2026-10-04 23:46:32.244233702 +0000
++++ pb/Extension/UI/Overlay/skate_menu_skater.cpp	2026-10-04 23:46:32.274014246 +0000
+@@ -131,6 +131,10 @@
+     if (ImGui::SliderFloat("##revert-boost-speed", &revert_speed, 0.5f, 15.0f, "+%.1f m/s", ImGuiSliderFlags_AlwaysClamp))
+         debug_request(menu, callbacks, {DebugAction::set_revert_boost_speed, false, revert_speed});
+     ImGui::EndDisabled();
++    bool probe = debug.probe;
++    if (toggle_row(menu, "Dark pop probe", "Records what the game does every tick to logs\\dark-pop-probe.csv. Turn it on, do a few dark pop attempts, turn it off, and send the file.",
++            probe, callbacks.queue_debug != nullptr))
++        debug_request(menu, callbacks, {DebugAction::set_probe_enabled, probe});
+     bool revert_boost = debug.revert_boost;
+     if (toggle_row(menu, "Revert Boost", "Adds the speed above each time you land an unfinished spin (an auto revert). Chain them to build speed.",
+             revert_boost, callbacks.queue_debug != nullptr))
+diff -ruN pa/Runtime/request_scheduler.h pb/Runtime/request_scheduler.h
+--- pa/Runtime/request_scheduler.h	2026-10-04 23:46:32.257548697 +0000
++++ pb/Runtime/request_scheduler.h	2026-10-04 23:46:32.285828116 +0000
+@@ -74,7 +74,7 @@
+         const bool restore = request.action == overlay::DebugAction::restore_debug;
+         if (!context.tick_ready || (!context.healthy && !restore) || loading() ||
+             request.action < overlay::DebugAction::set_free_camera ||
+-            request.action > overlay::DebugAction::set_revert_boost_speed || !std::isfinite(request.value) ||
++            request.action > overlay::DebugAction::set_probe_enabled || !std::isfinite(request.value) ||
+             (!restore && count<overlay::DebugRequest>() >= 16)) return false;
+         if (restore) clear<overlay::DebugRequest>();
+         append(request, thread); return true;
