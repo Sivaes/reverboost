@@ -16,6 +16,10 @@ on:
         description: Revert Boost version, x.y.z
         required: true
         default: 0.2.0
+      include_dark_pop:
+        description: Also include the Dark Pop test feature (leave off for a plain Revert Boost build to send to a friend)
+        type: boolean
+        default: false
       publish:
         description: Publish a self-updating GitHub release (leave off for a zip to test or send to a friend)
         type: boolean
@@ -34,7 +38,7 @@ jobs:
     env:
       UPSTREAM_REF: ${{ inputs.upstream_ref }}
       MOD_VERSION: ${{ inputs.mod_version }}
-      MOD_ID: ReSkate_RevertBoost
+      INCLUDE_DARK_POP: ${{ inputs.include_dark_pop }}
       PUBLISH: ${{ inputs.publish }}
 
     steps:
@@ -47,11 +51,28 @@ jobs:
           path: mod
           persist-credentials: false
 
+      - name: Find the ReSkate version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $want = "$env:UPSTREAM_REF".Trim()
+          $lines = git ls-remote --tags --refs https://github.com/Dingo-Shenanigans/ReSkate.git
+          if ($LASTEXITCODE -ne 0) { throw 'Could not reach github.com/Dingo-Shenanigans/ReSkate to list its versions.' }
+          $tags = @($lines | ForEach-Object { ($_ -split 'refs/tags/')[1] } | Where-Object { $_ })
+          if ($want -eq 'main') { $found = 'main' }
+          elseif ($tags -contains $want) { $found = $want }
+          elseif ($tags -contains "v$want") { $found = "v$want" }
+          else {
+            $recent = ($tags | Select-Object -Last 15) -join ', '
+            throw "ReSkate has no version called '$want'. Use 'main' or one of its release tags. Latest tags: $recent"
+          }
+          "Building on ReSkate: $found"
+          "RESOLVED_REF=$found" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       - name: Check out ReSkate
         uses: actions/checkout@v7
         with:
           repository: Dingo-Shenanigans/ReSkate
-          ref: ${{ inputs.upstream_ref }}
+          ref: ${{ env.RESOLVED_REF }}
           path: src
           persist-credentials: false
 
@@ -59,25 +80,38 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:MOD_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'mod_version must look like 1.2.3' }
-          if ($env:UPSTREAM_REF -match '^v?(\d+\.\d+\.\d+)$') { $base = $Matches[1]; $label = $base } else { $base = '0.0.0'; $label = $env:UPSTREAM_REF }
+          if ($env:RESOLVED_REF -match '^v?(\d+\.\d+\.\d+)$') { $base = $Matches[1]; $label = $base } else { $base = '0.0.0'; $label = $env:RESOLVED_REF }
           "BASE_VERSION=$base" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "BASE_LABEL=$label" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          # A build with Dark Pop in it says so in its name, so crash reports and the log can tell the two apart.
+          $name = if ($env:INCLUDE_DARK_POP -eq 'true') { 'ReSkate_RevertBoost_DarkPop' } else { 'ReSkate_RevertBoost' }
+          "MOD_NAME=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "ReSkate $label + Revert Boost $env:MOD_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
       - name: Apply the patch
         working-directory: src
         run: |
-          git apply --ignore-whitespace --check ../mod/patches/revert-boost.patch
-          if ($LASTEXITCODE -ne 0) { throw "patches/revert-boost.patch does not fit ReSkate $env:UPSTREAM_REF any more. ReSkate changed a file the patch edits; the patch needs updating for this version." }
-          git apply --ignore-whitespace ../mod/patches/revert-boost.patch
-          if ($LASTEXITCODE -ne 0) { throw 'The patch failed to apply.' }
+          $patches = @('revert-boost.patch')
+          if ($env:INCLUDE_DARK_POP -eq 'true') { $patches += 'dark-pop.patch' }
+          foreach ($name in $patches) {
+            $patch = Join-Path $env:GITHUB_WORKSPACE "mod/patches/$name"
+            if (-not (Test-Path $patch)) {
+              Write-Host 'Files in this repository:'
+              Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'mod') -Recurse -File -Name | Where-Object { $_ -notlike '.git*' } | Select-Object -First 40
+              throw "patches/$name is not in this repository. Upload the 'patches' folder from the zip so the file is at patches/$name."
+            }
+            git apply --ignore-whitespace --check $patch
+            if ($LASTEXITCODE -ne 0) { throw "patches/$name is there but does not fit ReSkate $env:RESOLVED_REF. ReSkate changed a file the patch edits; the patch needs updating for this version." }
+            git apply --ignore-whitespace $patch
+            if ($LASTEXITCODE -ne 0) { throw "patches/$name failed to apply." }
+          }
 
       - name: Configure
         # A published release updates itself from this repository's releases; a test zip never replaces itself.
         # Crash reports stay on and go where ReSkate's go, labelled with this mod's name and version.
         working-directory: src
         run: |
-          $cmakeArgs = @('--preset', 'vs2022-x64', "-DDINGOSDK_VERSION=$env:BASE_VERSION", "-DDINGOSDK_MOD_ID=$env:MOD_ID", "-DDINGOSDK_MOD_VERSION=$env:MOD_VERSION")
+          $cmakeArgs = @('--preset', 'vs2022-x64', "-DDINGOSDK_VERSION=$env:BASE_VERSION", "-DDINGOSDK_MOD_ID=$env:MOD_NAME", "-DDINGOSDK_MOD_VERSION=$env:MOD_VERSION")
           if ($env:PUBLISH -eq 'true') { $cmakeArgs += @('-DDINGOSDK_LAUNCHER_AUTO_UPDATE=ON', "-DDINGOSDK_RELEASE_REPO=${{ github.repository }}") }
           else { $cmakeArgs += '-DDINGOSDK_LAUNCHER_AUTO_UPDATE=OFF' }
           cmake @cmakeArgs
@@ -120,7 +154,7 @@ jobs:
       - name: Upload the zip
         uses: actions/upload-artifact@v7
         with:
-          name: ReSkate_RevertBoost-${{ inputs.mod_version }}-on-${{ inputs.upstream_ref }}
+          name: ${{ env.MOD_NAME }}-${{ inputs.mod_version }}-on-${{ inputs.upstream_ref }}
           path: out/release/ReSkate_RevertBoost-${{ inputs.mod_version }}.zip
           if-no-files-found: error
           retention-days: 30
