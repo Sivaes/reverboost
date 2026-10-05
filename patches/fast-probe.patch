@@ -1,0 +1,203 @@
+diff -ruN fpa/Extension/Skater/client_debug.cpp fpb/Extension/Skater/client_debug.cpp
+--- fpa/Extension/Skater/client_debug.cpp	2026-10-05 00:56:27.217615458 +0000
++++ fpb/Extension/Skater/client_debug.cpp	2026-10-05 00:56:27.251195668 +0000
+@@ -151,10 +151,36 @@
+ // game changes at the moment a pop happens, which is what a faithful Dark Pop needs to know.
+ namespace {
+ std::ofstream& probe_file() { static auto* file = new std::ofstream; return *file; }
++std::ofstream& fast_file() { static auto* file = new std::ofstream; return *file; }
++std::int64_t g_fast_base = 0;
++// Writes what the selector hook queued: logs\dark-pop-fast.csv, one row per physics-state choice with its time
++// in microseconds, the state before, the state the game wanted, the state returned, the buttons and 18 words.
++void fast_probe_flush() {
++    auto& file = fast_file();
++    if (!file.is_open()) return;
++    static FastProbeRow rows[2048];
++    LARGE_INTEGER frequency{};
++    QueryPerformanceFrequency(&frequency);
++    if (frequency.QuadPart <= 0) return;
++    char text[24];
++    for (int pass = 0; pass < 8; ++pass) {
++        const auto count = fast_probe_drain(rows, 2048);
++        for (std::size_t i = 0; i < count; ++i) {
++            const auto& row = rows[i];
++            if (!g_fast_base) g_fast_base = row.ticks;
++            file << (row.ticks - g_fast_base) * 1000000 / frequency.QuadPart << ',' << row.current << ',' << row.wanted << ','
++                 << row.chosen << ',' << row.buttons;
++            for (const auto word : row.words) { std::snprintf(text, sizeof text, ",%x", word); file << text; }
++            file << '\n';
++        }
++        if (count < 2048) break;
++    }
++}
+ void probe_tick(InteractiveDebug& debug, const std::array<float, 16>& transform, const NoclipBodies& bodies, bool ready) {
+     auto& file = probe_file();
+     if (!debug.probe || !ready) {
+         if (file.is_open()) file.close();
++        if (fast_file().is_open()) { fast_probe_enable(false); fast_probe_flush(); fast_file().close(); }
+         return;
+     }
+     if (!file.is_open()) {
+@@ -171,7 +197,16 @@
+         for (int i = 0; i < 64; ++i) file << ",b" << i;
+         for (int i = 0; i < 16; ++i) file << ",t" << i;
+         file << "\n";
+-        logging::write(logging::Level::info, logging::Channel::skater, "Dark pop probe: writing logs\\dark-pop-probe.csv");
++        auto& fast = fast_file();
++        fast.open(path.parent_path() / "dark-pop-fast.csv", std::ios::out | std::ios::trunc);
++        if (fast) {
++            fast << "us,current,wanted,chosen,pad";
++            for (int i = 0; i < 18; ++i) fast << ",w" << i;
++            fast << "\n";
++            g_fast_base = 0;
++            fast_probe_enable(true);
++        }
++        logging::write(logging::Level::info, logging::Channel::skater, "Dark pop probe: writing logs\\dark-pop-probe.csv and logs\\dark-pop-fast.csv");
+     }
+     // Guarded same-process copies of larger blocks (value<T> is limited to 16 bytes).
+     SourceReader reader;
+@@ -190,8 +225,9 @@
+     for (const auto value : board) { std::snprintf(text, sizeof text, ",%.4g", static_cast<double>(value)); file << text; }
+     for (const auto value : transform) { std::snprintf(text, sizeof text, ",%.4g", static_cast<double>(value)); file << text; }
+     file << '\n';
++    fast_probe_flush();
+     static ULONGLONG last_flush = 0;
+-    if (const auto now = GetTickCount64(); now - last_flush > 1000) { file.flush(); last_flush = now; }
++    if (const auto now = GetTickCount64(); now - last_flush > 1000) { file.flush(); if (fast_file().is_open()) fast_file().flush(); last_flush = now; }
+ }
+ }
+ std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model) {
+diff -ruN fpa/Extension/Skater/no_bail.cpp fpb/Extension/Skater/no_bail.cpp
+--- fpa/Extension/Skater/no_bail.cpp	2026-10-05 00:56:27.217355440 +0000
++++ fpb/Extension/Skater/no_bail.cpp	2026-10-05 00:56:27.251023584 +0000
+@@ -1,4 +1,5 @@
+ #include "no_bail.h"
++#include "Engine/Game/Input/controller_bindings.h"
+ #include "Engine/Core/Hooks/hooks.h"
+ #include "Engine/Core/Log/logging.h"
+ #include "Engine/Core/Platform/memory.h"
+@@ -119,6 +120,20 @@
+     if (owner) *owner = current;
+     return true;
+ }
++// The local skater this process published (the lease keeps its owner even with No Bail off), checked
++// against the live game objects. Says nothing about whether protection is on.
++bool local_owner(std::uintptr_t object, std::uintptr_t Owner::* member, Owner* owner = nullptr) noexcept {
++    auto& p = protection();
++    if (!p.ready.load(std::memory_order_acquire)) return false;
++    AcquireSRWLockShared(&p.lock);
++    const auto lease = p.lease;
++    ReleaseSRWLockShared(&p.lock);
++    if (!lease.owner.entity || !object || object != lease.owner.*member) return false;
++    Owner current;
++    if (!resolve(lease.owner.client, lease.owner.entity, current) || current != lease.owner) return false;
++    if (owner) *owner = current;
++    return true;
++}
+ bool cancel_request(std::uintptr_t context, std::uintptr_t offset, LONG mask) noexcept {
+     const auto address = context + offset;
+     if (context < 0x10000 || context > highest - offset - sizeof(LONG) ||
+@@ -185,6 +200,35 @@
+     if (!resolve(board.owner.client, board.owner.entity, current_owner) || current_owner != board.owner) return;
+     (void)cancel_request(current_owner.context, animation_request_offset, mount_request_mask);
+ }
++extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* input, bool allow_menu);
++constexpr std::size_t fast_probe_capacity = 8192; // rows; about a minute of choices per drain interval at most
++struct FastProbe {
++    std::atomic<bool> enabled{};
++    std::atomic<std::uint64_t> head{}, tail{};
++    FastProbeRow rows[fast_probe_capacity];
++};
++FastProbe& fast_probe() { static auto* value = new FastProbe; return *value; }
++void fast_probe_record(std::uintptr_t selector, std::uint32_t current, std::uint32_t wanted, std::uint32_t chosen) noexcept {
++    auto& f = fast_probe();
++    if (!f.enabled.load(std::memory_order_relaxed)) return;
++    Owner owner;
++    if (!local_owner(selector, &Owner::selector, &owner)) return;
++    const auto head = f.head.load(std::memory_order_relaxed);
++    if (head - f.tail.load(std::memory_order_acquire) >= fast_probe_capacity) return;
++    auto& row = f.rows[head % fast_probe_capacity];
++    LARGE_INTEGER now{};
++    QueryPerformanceCounter(&now);
++    row.ticks = now.QuadPart;
++    row.current = current;
++    row.wanted = wanted;
++    row.chosen = chosen;
++    dingosdk::ControllerInput pad;
++    DingoSDKOverlayReadControllerInput(&pad, false);
++    row.buttons = pad.available ? pad.buttons : 0u;
++    for (int i = 0; i < 8; ++i) { unsigned word{}; row.words[i] = read(owner.context + 0x13c4 + 4 * i, word) ? word : 0u; }
++    for (int i = 0; i < 10; ++i) { unsigned word{}; row.words[8 + i] = read(owner.context + 0x140c + 4 * i, word) ? word : 0u; }
++    f.head.store(head + 1, std::memory_order_release);
++}
+ std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
+     {
+         LastError error;
+@@ -197,6 +241,7 @@
+     const auto next = protection().choose_original(selector, current);
+     LastError error;
+     const auto chosen = filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
++    fast_probe_record(selector, current, next, chosen);
+     auto& w = state_watch();
+     if (selector == w.selector.load(std::memory_order_acquire) && GetTickCount64() < w.until.load(std::memory_order_acquire)) {
+         if (const auto before = w.state.exchange(chosen, std::memory_order_acq_rel); before != chosen) {
+@@ -391,6 +436,20 @@
+     p.lease = {};
+     ReleaseSRWLockExclusive(&p.lock);
+ }
++void fast_probe_enable(bool on) noexcept {
++    auto& f = fast_probe();
++    if (on) f.tail.store(f.head.load(std::memory_order_acquire), std::memory_order_release); // start empty
++    f.enabled.store(on, std::memory_order_release);
++}
++std::size_t fast_probe_drain(FastProbeRow* rows, std::size_t capacity) noexcept {
++    auto& f = fast_probe();
++    auto tail = f.tail.load(std::memory_order_relaxed);
++    const auto head = f.head.load(std::memory_order_acquire);
++    std::size_t count = 0;
++    while (tail != head && count < capacity) rows[count++] = f.rows[tail++ % fast_probe_capacity];
++    f.tail.store(tail, std::memory_order_release);
++    return count;
++}
+ void watch_physics_state(std::uintptr_t client, std::uintptr_t entity) noexcept {
+     auto& w = state_watch();
+     Owner owner;
+diff -ruN fpa/Extension/Skater/no_bail.h fpb/Extension/Skater/no_bail.h
+--- fpa/Extension/Skater/no_bail.h	2026-10-05 00:56:27.217394428 +0000
++++ fpb/Extension/Skater/no_bail.h	2026-10-05 00:56:27.251042162 +0000
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <cstddef>
+ #include <cstdint>
+ 
+ namespace dingosdk {
+@@ -25,6 +26,17 @@
+ };
+ void watch_physics_state(std::uintptr_t client, std::uintptr_t entity) noexcept;
+ PhysicsStateWatch watched_physics_state() noexcept;
++// Fast probe: one row for every physics-state choice the game makes for the local skater (many per
++// second, where the client tick sees about nine), with the state it was in, the state the game wanted,
++// what was returned, the controller buttons and some of the skater's request words. Read-only. Rows are
++// queued by the selector hook and drained by the client tick; a full queue drops rows.
++struct FastProbeRow {
++    std::int64_t ticks{}; // QueryPerformanceCounter
++    std::uint32_t current{}, wanted{}, chosen{}, buttons{};
++    std::uint32_t words[18]{}; // context+0x13c4..0x13e0, then +0x140c..0x1430
++};
++void fast_probe_enable(bool on) noexcept;
++std::size_t fast_probe_drain(FastProbeRow* rows, std::size_t capacity) noexcept;
+ // Stopping flight must not discard the independent manual preference.
+ void clear_no_bail_flight() noexcept;
+ }
+diff -ruN fpa/Extension/UI/Overlay/skate_menu_skater.cpp fpb/Extension/UI/Overlay/skate_menu_skater.cpp
+--- fpa/Extension/UI/Overlay/skate_menu_skater.cpp	2026-10-05 00:56:27.219595395 +0000
++++ fpb/Extension/UI/Overlay/skate_menu_skater.cpp	2026-10-05 00:56:27.253810521 +0000
+@@ -132,7 +132,7 @@
+         debug_request(menu, callbacks, {DebugAction::set_revert_boost_speed, false, revert_speed});
+     ImGui::EndDisabled();
+     bool probe = debug.probe;
+-    if (toggle_row(menu, "Dark pop probe", "Records what the game does every tick to logs\\dark-pop-probe.csv. Turn it on, do a few dark pop attempts, turn it off, and send the file.",
++    if (toggle_row(menu, "Dark pop probe", "Records what the game does to logs\\dark-pop-probe.csv and logs\\dark-pop-fast.csv. Turn it on, do a few dark pop attempts, turn it off, and send both files.",
+             probe, callbacks.queue_debug != nullptr))
+         debug_request(menu, callbacks, {DebugAction::set_probe_enabled, probe});
+     bool revert_boost = debug.revert_boost;
