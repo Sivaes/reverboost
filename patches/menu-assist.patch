@@ -1,0 +1,199 @@
+diff -ruN aa/Extension/Skater/client_debug.cpp ab/Extension/Skater/client_debug.cpp
+--- aa/Extension/Skater/client_debug.cpp	2026-10-05 00:26:41.555821427 +0000
++++ ab/Extension/Skater/client_debug.cpp	2026-10-05 00:26:41.792422000 +0000
+@@ -143,6 +143,24 @@
+             fire ? ", BOOST" : unfinished ? (allowed ? ", no boost (not on ground / cooldown / speed)" : ", off") : "");
+ }
+ }
++// ---- Dark pop menu assist -------------------------------------------------------
++// The work is done in the physics selector hook (no_bail.cpp). This tick reads D-pad Right, publishes it,
++// and reports each time the "D-pad menu open" flag was cleared early. Nothing is read until it is switched on.
++namespace {
++void menu_assist_tick(InteractiveDebug& debug, bool ready) {
++    if (!debug.menu_assist) { menu_assist_update(false, false); return; }
++    const bool allowed = ready && session_boosts_allowed() && !debug.noclip && !debug.park_editor;
++    ControllerInput pad;
++    DingoSDKOverlayReadControllerInput(&pad);
++    menu_assist_update(allowed, pad.available && (pad.buttons & 0x8) != 0);
++    const auto cleared = menu_assist_count();
++    if (cleared != debug.menu_assist_seen) {
++        debug.menu_assist_seen = cleared;
++        logging::write(logging::Level::info, logging::Channel::skater,
++            "Dark pop menu assist: cleared the D-pad menu flag early so the landing sees a closed menu");
++    }
++}
++}
+ // ---- Dark pop probe -----------------------------------------------------------
+ // Off unless switched on. While on it writes logs\dark-pop-probe.csv beside the game: one row per tick
+ // with the physics state, the controller buttons, 40 words of the skater's request block (where the game
+@@ -567,6 +585,13 @@
+         debug.status = up ? "Up Boost speed updated." : "Forward Boost speed updated.";
+         return;
+     }
++    if (request.action == overlay::DebugAction::set_menu_assist_enabled) {
++        debug.menu_assist = request.enabled;
++        debug.status = request.enabled ? "Dark pop menu assist on." : "Dark pop menu assist off.";
++        logging::log(logging::Level::info, logging::Channel::skater, "Dark pop menu assist {}{}", request.enabled ? "enabled" : "disabled",
++            dingosdk::reskate_modified_build ? std::format(" (modified build {} {})", dingosdk::reskate_mod_id, dingosdk::reskate_mod_version) : std::string());
++        return;
++    }
+     if (request.action == overlay::DebugAction::set_probe_enabled) {
+         debug.probe = request.enabled;
+         debug.status = request.enabled ? "Dark pop probe on: writing logs\\dark-pop-probe.csv." : "Dark pop probe off.";
+@@ -953,6 +978,8 @@
+         } else if (debug.up_velocity.valid) {
+             model.up_velocity_unavailable = "Up Boost is being applied.";
+         }
++        try { menu_assist_tick(debug, can_control); }
++        catch (...) {}
+         try { probe_tick(debug, skater_transform, bodies, can_control); }
+         catch (...) {}
+         try { revert_boost_tick(debug, client, model.skater_identity, skater_transform, bodies, can_control); }
+@@ -1007,6 +1034,7 @@
+     model.forward_velocity_updates = debug.forward_velocity_updates;
+     model.up_velocity_speed = debug.up_velocity_speed;
+     model.up_velocity_updates = debug.up_velocity_updates;
++    model.menu_assist = debug.menu_assist;
+     model.probe = debug.probe;
+     model.revert_boost = debug.revert_boost;
+     model.revert_boost_speed = debug.revert_boost_speed;
+diff -ruN aa/Extension/Skater/client_source_spawn_internal.h ab/Extension/Skater/client_source_spawn_internal.h
+--- aa/Extension/Skater/client_source_spawn_internal.h	2026-10-05 00:26:41.554491714 +0000
++++ ab/Extension/Skater/client_source_spawn_internal.h	2026-10-05 00:26:41.790764106 +0000
+@@ -135,6 +135,8 @@
+     bool revert_boost{};
+     float revert_boost_speed = 2.0f; // metres per second added along the direction of travel
+     std::uint64_t revert_boost_count{};
++    bool menu_assist{};
++    std::uint64_t menu_assist_seen{};
+     bool probe{}; // see probe_tick in client_debug.cpp
+     struct RevertTrack {
+         bool airborne{};
+diff -ruN aa/Extension/Skater/no_bail.cpp ab/Extension/Skater/no_bail.cpp
+--- aa/Extension/Skater/no_bail.cpp	2026-10-05 00:26:41.554865547 +0000
++++ ab/Extension/Skater/no_bail.cpp	2026-10-05 00:26:41.791337528 +0000
+@@ -119,6 +119,20 @@
+     if (owner) *owner = current;
+     return true;
+ }
++// The local skater this process published (the lease keeps its owner even with No Bail off), checked
++// against the live game objects. Says nothing about whether protection is on.
++bool local_owner(std::uintptr_t object, std::uintptr_t Owner::* member, Owner* owner = nullptr) noexcept {
++    auto& p = protection();
++    if (!p.ready.load(std::memory_order_acquire)) return false;
++    AcquireSRWLockShared(&p.lock);
++    const auto lease = p.lease;
++    ReleaseSRWLockShared(&p.lock);
++    if (!lease.owner.entity || !object || object != lease.owner.*member) return false;
++    Owner current;
++    if (!resolve(lease.owner.client, lease.owner.entity, current) || current != lease.owner) return false;
++    if (owner) *owner = current;
++    return true;
++}
+ bool cancel_request(std::uintptr_t context, std::uintptr_t offset, LONG mask) noexcept {
+     const auto address = context + offset;
+     if (context < 0x10000 || context > highest - offset - sizeof(LONG) ||
+@@ -185,10 +199,28 @@
+     if (!resolve(board.owner.client, board.owner.entity, current_owner) || current_owner != board.owner) return;
+     (void)cancel_request(current_owner.context, animation_request_offset, mount_request_mask);
+ }
++struct MenuAssist {
++    std::atomic<bool> enabled{};
++    std::atomic<std::uint64_t> down_until{}, cleared{};
++};
++MenuAssist& menu_assist() { static auto* value = new MenuAssist; return *value; }
++constexpr std::uintptr_t menu_flags_offset = 0x13dc; // the request block word with the D-pad menu flag
++constexpr LONG menu_open_mask = 0x800;
++void menu_assist_apply(std::uintptr_t selector, std::uint32_t current) noexcept {
++    auto& m = menu_assist();
++    if (!m.enabled.load(std::memory_order_relaxed) || current < 200 || current >= 300) return;
++    if (GetTickCount64() < m.down_until.load(std::memory_order_relaxed)) return; // D-pad still down, or only just let go
++    Owner owner;
++    if (!local_owner(selector, &Owner::selector, &owner)) return;
++    unsigned word{};
++    if (!read(owner.context + menu_flags_offset, word) || !(word & static_cast<unsigned>(menu_open_mask))) return;
++    if (cancel_request(owner.context, menu_flags_offset, menu_open_mask)) m.cleared.fetch_add(1, std::memory_order_acq_rel);
++}
+ std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
+     {
+         LastError error;
+         hold_off_board(selector, current);
++        menu_assist_apply(selector, current);
+     }
+     // Clear shared requests before selection so native ground/air/walking
+     // transitions can still run. Some contact tests return Wipeout directly;
+@@ -391,6 +423,12 @@
+     p.lease = {};
+     ReleaseSRWLockExclusive(&p.lock);
+ }
++void menu_assist_update(bool enabled, bool dpad_down) noexcept {
++    auto& m = menu_assist();
++    m.enabled.store(enabled, std::memory_order_relaxed);
++    if (enabled && dpad_down) m.down_until.store(GetTickCount64() + 120, std::memory_order_relaxed);
++}
++std::uint64_t menu_assist_count() noexcept { return menu_assist().cleared.load(std::memory_order_acquire); }
+ void watch_physics_state(std::uintptr_t client, std::uintptr_t entity) noexcept {
+     auto& w = state_watch();
+     Owner owner;
+diff -ruN aa/Extension/Skater/no_bail.h ab/Extension/Skater/no_bail.h
+--- aa/Extension/Skater/no_bail.h	2026-10-05 00:26:41.554975198 +0000
++++ ab/Extension/Skater/no_bail.h	2026-10-05 00:26:41.791493351 +0000
+@@ -25,6 +25,13 @@
+ };
+ void watch_physics_state(std::uintptr_t client, std::uintptr_t entity) noexcept;
+ PhysicsStateWatch watched_physics_state() noexcept;
++// Dark pop menu assist. The game keeps a "D-pad menu is open" flag in the skater's request block (context
++// +0x13dc, bit 0x800). In a recording of dark pop attempts the pops all had that flag cleared at least
++// ~0.4 s before landing and the bails had it still set closer to the landing. While enabled, once the D-pad
++// has been let go in the air the flag is cleared on every physics tick, so the landing sees a closed menu.
++// Publish from the client tick. `dpad_down`: D-pad Right is down right now.
++void menu_assist_update(bool enabled, bool dpad_down) noexcept;
++std::uint64_t menu_assist_count() noexcept; // flags cleared since the process started
+ // Stopping flight must not discard the independent manual preference.
+ void clear_no_bail_flight() noexcept;
+ }
+diff -ruN aa/Extension/UI/Overlay/overlay.h ab/Extension/UI/Overlay/overlay.h
+--- aa/Extension/UI/Overlay/overlay.h	2026-10-05 00:26:41.566718824 +0000
++++ ab/Extension/UI/Overlay/overlay.h	2026-10-05 00:26:41.801736460 +0000
+@@ -70,6 +70,7 @@
+     set_revert_boost_enabled,
+     set_revert_boost_speed,
+     set_probe_enabled,
++    set_menu_assist_enabled,
+     // Keep the last action in sync with the bound in request_scheduler.h.
+ };
+ 
+@@ -121,6 +122,7 @@
+     bool revert_boost = false;
+     float revert_boost_speed = 2.0f;
+     std::uint64_t revert_boost_count = 0;
++    bool menu_assist = false; // Dark pop menu assist (see no_bail.cpp)
+     bool probe = false; // Dark pop probe: writes logs\dark-pop-probe.csv
+     bool camera_position_valid = false;
+     bool skater_position_valid = false;
+diff -ruN aa/Extension/UI/Overlay/skate_menu_skater.cpp ab/Extension/UI/Overlay/skate_menu_skater.cpp
+--- aa/Extension/UI/Overlay/skate_menu_skater.cpp	2026-10-05 00:26:41.571121056 +0000
++++ ab/Extension/UI/Overlay/skate_menu_skater.cpp	2026-10-05 00:26:41.805506578 +0000
+@@ -131,6 +131,10 @@
+     if (ImGui::SliderFloat("##revert-boost-speed", &revert_speed, 0.5f, 15.0f, "+%.1f m/s", ImGuiSliderFlags_AlwaysClamp))
+         debug_request(menu, callbacks, {DebugAction::set_revert_boost_speed, false, revert_speed});
+     ImGui::EndDisabled();
++    bool menu_assist = debug.menu_assist;
++    if (toggle_row(menu, "Dark pop menu assist", "While you are in the air, closes the game's \"D-pad menu open\" flag as soon as you let go of D-pad Right, so a dark pop is not spoiled by the menu closing too late. Experimental.",
++            menu_assist, callbacks.queue_debug != nullptr))
++        debug_request(menu, callbacks, {DebugAction::set_menu_assist_enabled, menu_assist});
+     bool probe = debug.probe;
+     if (toggle_row(menu, "Dark pop probe", "Records what the game does every tick to logs\\dark-pop-probe.csv. Turn it on, do a few dark pop attempts, turn it off, and send the file.",
+             probe, callbacks.queue_debug != nullptr))
+diff -ruN aa/Runtime/request_scheduler.h ab/Runtime/request_scheduler.h
+--- aa/Runtime/request_scheduler.h	2026-10-05 00:26:41.713956569 +0000
++++ ab/Runtime/request_scheduler.h	2026-10-05 00:26:41.956462285 +0000
+@@ -74,7 +74,7 @@
+         const bool restore = request.action == overlay::DebugAction::restore_debug;
+         if (!context.tick_ready || (!context.healthy && !restore) || loading() ||
+             request.action < overlay::DebugAction::set_free_camera ||
+-            request.action > overlay::DebugAction::set_probe_enabled || !std::isfinite(request.value) ||
++            request.action > overlay::DebugAction::set_menu_assist_enabled || !std::isfinite(request.value) ||
+             (!restore && count<overlay::DebugRequest>() >= 16)) return false;
+         if (restore) clear<overlay::DebugRequest>();
+         append(request, thread); return true;
