@@ -1,0 +1,267 @@
+diff -ruN r1/Extension/Skater/client_debug.cpp r2/Extension/Skater/client_debug.cpp
+--- r1/Extension/Skater/client_debug.cpp	2026-10-05 03:34:59.864841810 +0000
++++ r2/Extension/Skater/client_debug.cpp	2026-10-05 03:35:00.309694099 +0000
+@@ -143,6 +143,30 @@
+             fire ? ", BOOST" : unfinished ? (allowed ? ", no boost (not on ground / cooldown / speed)" : ", off") : "");
+ }
+ }
++// ---- Dark pop contact assist ----------------------------------------------------
++// The work is done in the physics selector hook (no_bail.cpp). This tick reads D-pad Right, publishes it and
++// reports each time the landing-contact flag was cleared. Nothing is read until it is switched on.
++namespace {
++void contact_assist_tick(InteractiveDebug& debug, bool ready) {
++    if (!debug.contact_assist) { contact_assist_update(false, false); return; }
++    const bool allowed = ready && session_boosts_allowed() && !debug.noclip && !debug.park_editor;
++    ControllerInput pad;
++    DingoSDKOverlayReadControllerInput(&pad);
++    contact_assist_update(allowed, pad.available && (pad.buttons & 0x8) != 0);
++    const auto holds = contact_assist_holds();
++    if (holds != debug.contact_assist_holds_seen) {
++        debug.contact_assist_holds_seen = holds;
++        logging::write(logging::Level::info, logging::Channel::skater,
++            "Dark pop assist: the game chose the pop; held off the wipeout it asked for right after");
++    }
++    const auto cleared = contact_assist_count();
++    if (cleared != debug.contact_assist_seen) {
++        debug.contact_assist_seen = cleared;
++        logging::write(logging::Level::info, logging::Channel::skater,
++            std::format("Dark pop assist: cleared the bail flags (mask {:#x}) so the pop is judged first", contact_assist_last_mask()));
++    }
++}
++}
+ // ---- Dark pop probe -----------------------------------------------------------
+ // Off unless switched on. While on it writes logs\dark-pop-probe.csv beside the game: one row per tick
+ // with the physics state, the controller buttons, 40 words of the skater's request block (where the game
+@@ -603,6 +627,13 @@
+         debug.status = up ? "Up Boost speed updated." : "Forward Boost speed updated.";
+         return;
+     }
++    if (request.action == overlay::DebugAction::set_contact_assist_enabled) {
++        debug.contact_assist = request.enabled;
++        debug.status = request.enabled ? "Dark pop contact assist on. Hold D-pad Right as you land in the dark catch." : "Dark pop contact assist off.";
++        logging::log(logging::Level::info, logging::Channel::skater, "Dark pop contact assist {}{}", request.enabled ? "enabled" : "disabled",
++            dingosdk::reskate_modified_build ? std::format(" (modified build {} {})", dingosdk::reskate_mod_id, dingosdk::reskate_mod_version) : std::string());
++        return;
++    }
+     if (request.action == overlay::DebugAction::set_probe_enabled) {
+         debug.probe = request.enabled;
+         debug.status = request.enabled ? "Dark pop probe on: writing logs\\dark-pop-probe.csv." : "Dark pop probe off.";
+@@ -989,6 +1020,8 @@
+         } else if (debug.up_velocity.valid) {
+             model.up_velocity_unavailable = "Up Boost is being applied.";
+         }
++        try { contact_assist_tick(debug, can_control); }
++        catch (...) {}
+         try { probe_tick(debug, skater_transform, bodies, can_control); }
+         catch (...) {}
+         try { revert_boost_tick(debug, client, model.skater_identity, skater_transform, bodies, can_control); }
+@@ -1043,6 +1076,7 @@
+     model.forward_velocity_updates = debug.forward_velocity_updates;
+     model.up_velocity_speed = debug.up_velocity_speed;
+     model.up_velocity_updates = debug.up_velocity_updates;
++    model.contact_assist = debug.contact_assist;
+     model.probe = debug.probe;
+     model.revert_boost = debug.revert_boost;
+     model.revert_boost_speed = debug.revert_boost_speed;
+diff -ruN r1/Extension/Skater/client_source_spawn_internal.h r2/Extension/Skater/client_source_spawn_internal.h
+--- r1/Extension/Skater/client_source_spawn_internal.h	2026-10-05 03:34:59.863258691 +0000
++++ r2/Extension/Skater/client_source_spawn_internal.h	2026-10-05 03:35:00.308379751 +0000
+@@ -135,6 +135,8 @@
+     bool revert_boost{};
+     float revert_boost_speed = 2.0f; // metres per second added along the direction of travel
+     std::uint64_t revert_boost_count{};
++    bool contact_assist{};
++    std::uint64_t contact_assist_seen{}, contact_assist_holds_seen{};
+     bool probe{}; // see probe_tick in client_debug.cpp
+     struct RevertTrack {
+         bool airborne{};
+diff -ruN r1/Extension/Skater/no_bail.cpp r2/Extension/Skater/no_bail.cpp
+--- r1/Extension/Skater/no_bail.cpp	2026-10-05 03:34:59.863833638 +0000
++++ r2/Extension/Skater/no_bail.cpp	2026-10-05 03:35:00.308819152 +0000
+@@ -8,6 +8,7 @@
+ #include "Engine/Game/Build/20260929/engine.h"
+ #include "Engine/Game/Build/20260929/no_bail.h"
+ #include <atomic>
++#include <iterator>
+ #include <intrin.h>
+ 
+ namespace dingosdk {
+@@ -200,6 +201,78 @@
+     if (!resolve(board.owner.client, board.owner.entity, current_owner) || current_owner != board.owner) return;
+     (void)cancel_request(current_owner.context, animation_request_offset, mount_request_mask);
+ }
++struct ContactAssist {
++    std::atomic<bool> enabled{};
++    std::atomic<std::uint64_t> armed_until{}, cleared{}; // armed_until: D-pad Right was down until this time
++    std::atomic<unsigned> last_mask{};
++    std::atomic<bool> latched{}; // the D-pad menu was brought up during the current flight
++    std::atomic<bool> consumed{}; // the game already chose a pop in this flight: the latch is spent until touchdown
++    std::atomic<std::uint64_t> pop_until{}, holds{}; // pop_until: the game chose the pop, protect it until this time
++};
++ContactAssist& contact_assist() { static auto* value = new ContactAssist; return *value; }
++// The "bail package". In 38 recorded dark pop attempts the game raised these on the tick before it chose to
++// bail (state 504) and never in an attempt that popped: context+0x13c4 bit 0x8000, +0x13c8 bits 0x2c000,
++// +0x13cc bit 0x400 (landing contact) and +0x13d4 bit 0x100 (the dismount request). A pop has the landing
++// stage (+0x13c8 bit 0x4000000) without them.
++struct BailFlag { std::uintptr_t offset; unsigned mask; };
++constexpr BailFlag bail_flags[] = {{0x13c4, 0x8000}, {0x13c8, 0x2c000}, {0x13cc, 0x400}, {0x13d4, 0x100}};
++constexpr unsigned landing_stage_bit = 0x4000000;
++void contact_assist_apply(std::uintptr_t selector, std::uint32_t current) noexcept {
++    auto& a = contact_assist();
++    if (!a.enabled.load(std::memory_order_relaxed)) return;
++    Owner owner;
++    if (!local_owner(selector, &Owner::selector, &owner)) return;
++    // On the ground everything starts over. In the air, bringing the menu up at any point latches it for the
++    // rest of the flight, so the landing no longer depends on exactly when the D-pad is let go.
++    if (current < 200 || current >= 300) {
++        a.latched.store(false, std::memory_order_relaxed);
++        a.consumed.store(false, std::memory_order_relaxed);
++        return;
++    }
++    const auto now = GetTickCount64();
++    if (now < a.armed_until.load(std::memory_order_relaxed) && !a.consumed.load(std::memory_order_relaxed))
++        a.latched.store(true, std::memory_order_relaxed);
++    const bool pop_window = now < a.pop_until.load(std::memory_order_relaxed);
++    if (!pop_window && (current != 201 || !a.latched.load(std::memory_order_relaxed))) return;
++    unsigned landing{};
++    // Before the pop: only at the landing stage. During the pop's first moments: whenever.
++    if (!pop_window && (!read(owner.context + 0x13c8, landing) || !(landing & landing_stage_bit))) return;
++    unsigned found = 0;
++    for (unsigned i = 0; i < std::size(bail_flags); ++i) {
++        unsigned word{};
++        if (read(owner.context + bail_flags[i].offset, word) && (word & bail_flags[i].mask)) found |= 1u << i;
++    }
++    if (!found) return;
++    for (unsigned i = 0; i < std::size(bail_flags); ++i)
++        if (found & (1u << i)) cancel_request(owner.context, bail_flags[i].offset, static_cast<LONG>(bail_flags[i].mask));
++    a.last_mask.store(found, std::memory_order_relaxed);
++    a.cleared.fetch_add(1, std::memory_order_acq_rel);
++}
++// After the original selector ran. A recording of the assist working showed the game choosing the pop (state
++// 200) and then, on the very next tick, asking for a wipeout (300) because the landing it sees is still the
++// bad one. That is the wipeout No Bail removes. For a moment after a pop the game chose itself, do the same,
++// and only for that: the wipeout result is swapped for staying in the current air state.
++std::uint32_t contact_assist_after(std::uintptr_t selector, std::uint32_t current, std::uint32_t next, std::uint32_t kept) noexcept {
++    auto& a = contact_assist();
++    if (!a.enabled.load(std::memory_order_relaxed)) return kept;
++    const auto now = GetTickCount64();
++    if (current == 201 && next == 200 && a.latched.load(std::memory_order_relaxed)) {
++        Owner owner;
++        if (local_owner(selector, &Owner::selector, &owner)) {
++            a.pop_until.store(now + 700, std::memory_order_relaxed);
++            a.latched.store(false, std::memory_order_relaxed);
++            a.consumed.store(true, std::memory_order_relaxed);
++        }
++        return kept;
++    }
++    if (next != wipeout_physics_state || now >= a.pop_until.load(std::memory_order_relaxed)) return kept;
++    Owner owner;
++    if (!local_owner(selector, &Owner::selector, &owner)) return kept;
++    cancel_wipeout_requests(owner.context);
++    reset_pending_causes(owner.causes);
++    a.holds.fetch_add(1, std::memory_order_acq_rel);
++    return current;
++}
+ extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* input, bool allow_menu);
+ constexpr std::size_t fast_probe_capacity = 8192; // rows; about a minute of choices per drain interval at most
+ struct FastProbe {
+@@ -233,6 +306,7 @@
+     {
+         LastError error;
+         hold_off_board(selector, current);
++        contact_assist_apply(selector, current);
+     }
+     // Clear shared requests before selection so native ground/air/walking
+     // transitions can still run. Some contact tests return Wipeout directly;
+@@ -240,7 +314,8 @@
+     const bool filtered = filter_requests(selector, &Owner::selector);
+     const auto next = protection().choose_original(selector, current);
+     LastError error;
+-    const auto chosen = filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
++    const auto kept = filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
++    const auto chosen = contact_assist_after(selector, current, next, kept);
+     fast_probe_record(selector, current, next, chosen);
+     auto& w = state_watch();
+     if (selector == w.selector.load(std::memory_order_acquire) && GetTickCount64() < w.until.load(std::memory_order_acquire)) {
+@@ -436,6 +511,14 @@
+     p.lease = {};
+     ReleaseSRWLockExclusive(&p.lock);
+ }
++void contact_assist_update(bool enabled, bool dpad_down) noexcept {
++    auto& a = contact_assist();
++    a.enabled.store(enabled, std::memory_order_relaxed);
++    if (enabled && dpad_down) a.armed_until.store(GetTickCount64() + 250, std::memory_order_relaxed); // down now (the client tick runs about 9 times a second)
++}
++std::uint64_t contact_assist_count() noexcept { return contact_assist().cleared.load(std::memory_order_acquire); }
++std::uint64_t contact_assist_holds() noexcept { return contact_assist().holds.load(std::memory_order_acquire); }
++unsigned contact_assist_last_mask() noexcept { return contact_assist().last_mask.load(std::memory_order_relaxed); }
+ void fast_probe_enable(bool on) noexcept {
+     auto& f = fast_probe();
+     if (on) f.tail.store(f.head.load(std::memory_order_acquire), std::memory_order_release); // start empty
+diff -ruN r1/Extension/Skater/no_bail.h r2/Extension/Skater/no_bail.h
+--- r1/Extension/Skater/no_bail.h	2026-10-05 03:34:59.864002158 +0000
++++ r2/Extension/Skater/no_bail.h	2026-10-05 03:35:00.308919539 +0000
+@@ -37,6 +37,18 @@
+ };
+ void fast_probe_enable(bool on) noexcept;
+ std::size_t fast_probe_drain(FastProbeRow* rows, std::size_t capacity) noexcept;
++// Dark pop landing assist ("contact assist"). A recording of 38 dark pop attempts showed the game raises a
++// package of flags in the skater's request block on the tick before it bails (the dismount request at
++// context+0x13d4 bit 0x100 and three others, see no_bail.cpp) and never in an attempt that popped. While
++// enabled, once D-pad Right (the menu) has been down at any point in the current flight, those flags are cleared
++// on the tick the landing stage shows, so the game judges the pop first; the latch resets when the skater is back
++// on the ground. When the game then chooses the pop by itself, the wipeout it asks for on the next ticks is held off
++// for 0.7 s (the same swap No Bail does), and the bail flags are cleared in that window too.
++// Publish from the client tick.
++void contact_assist_update(bool enabled, bool dpad_down) noexcept;
++std::uint64_t contact_assist_count() noexcept; // times the flags were cleared since the process started
++std::uint64_t contact_assist_holds() noexcept; // wipeouts held off during a pop since the process started
++unsigned contact_assist_last_mask() noexcept; // which of the four were set the last time (bit 0..3)
+ // Stopping flight must not discard the independent manual preference.
+ void clear_no_bail_flight() noexcept;
+ }
+diff -ruN r1/Extension/UI/Overlay/overlay.h r2/Extension/UI/Overlay/overlay.h
+--- r1/Extension/UI/Overlay/overlay.h	2026-10-05 03:34:59.869580349 +0000
++++ r2/Extension/UI/Overlay/overlay.h	2026-10-05 03:35:00.314944572 +0000
+@@ -70,6 +70,7 @@
+     set_revert_boost_enabled,
+     set_revert_boost_speed,
+     set_probe_enabled,
++    set_contact_assist_enabled,
+     // Keep the last action in sync with the bound in request_scheduler.h.
+ };
+ 
+@@ -121,6 +122,7 @@
+     bool revert_boost = false;
+     float revert_boost_speed = 2.0f;
+     std::uint64_t revert_boost_count = 0;
++    bool contact_assist = false; // Dark pop contact assist (see no_bail.cpp)
+     bool probe = false; // Dark pop probe: writes logs\dark-pop-probe.csv
+     bool camera_position_valid = false;
+     bool skater_position_valid = false;
+diff -ruN r1/Extension/UI/Overlay/skate_menu_skater.cpp r2/Extension/UI/Overlay/skate_menu_skater.cpp
+--- r1/Extension/UI/Overlay/skate_menu_skater.cpp	2026-10-05 03:34:59.871143629 +0000
++++ r2/Extension/UI/Overlay/skate_menu_skater.cpp	2026-10-05 03:35:00.317056091 +0000
+@@ -131,6 +131,10 @@
+     if (ImGui::SliderFloat("##revert-boost-speed", &revert_speed, 0.5f, 15.0f, "+%.1f m/s", ImGuiSliderFlags_AlwaysClamp))
+         debug_request(menu, callbacks, {DebugAction::set_revert_boost_speed, false, revert_speed});
+     ImGui::EndDisabled();
++    bool contact_assist = debug.contact_assist;
++    if (toggle_row(menu, "Dark pop contact assist", "Once you bring the D-pad menu up (D-pad Right) during a flight, the mod clears the flags the game raises just before it bails, at the landing, so it judges the pop first, and holds off the wipeout that follows the pop. Experimental; works with No Bail on or off.",
++            contact_assist, callbacks.queue_debug != nullptr))
++        debug_request(menu, callbacks, {DebugAction::set_contact_assist_enabled, contact_assist});
+     bool probe = debug.probe;
+     if (toggle_row(menu, "Dark pop probe", "Records what the game does to logs\\dark-pop-probe.csv and logs\\dark-pop-fast.csv. Turn it on, do a few dark pop attempts, turn it off, and send both files.",
+             probe, callbacks.queue_debug != nullptr))
+diff -ruN r1/Runtime/request_scheduler.h r2/Runtime/request_scheduler.h
+--- r1/Runtime/request_scheduler.h	2026-10-05 03:35:00.131853471 +0000
++++ r2/Runtime/request_scheduler.h	2026-10-05 03:35:00.387892844 +0000
+@@ -74,7 +74,7 @@
+         const bool restore = request.action == overlay::DebugAction::restore_debug;
+         if (!context.tick_ready || (!context.healthy && !restore) || loading() ||
+             request.action < overlay::DebugAction::set_free_camera ||
+-            request.action > overlay::DebugAction::set_probe_enabled || !std::isfinite(request.value) ||
++            request.action > overlay::DebugAction::set_contact_assist_enabled || !std::isfinite(request.value) ||
+             (!restore && count<overlay::DebugRequest>() >= 16)) return false;
+         if (restore) clear<overlay::DebugRequest>();
+         append(request, thread); return true;
