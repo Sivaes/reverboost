@@ -101,8 +101,8 @@ jobs:
           $patches = @('revert-boost.patch')
           if ($env:EXTRA_FEATURE -eq 'dark-pop') { $patches += 'dark-pop.patch' }
           if ($env:EXTRA_FEATURE -eq 'probe') { $patches += 'dark-pop-probe.patch' }
-          if ($env:EXTRA_FEATURE -eq 'contact-assist') { $patches += 'dark-pop-probe.patch'; $patches += 'fast-probe.patch'; $patches += 'contact-assist.patch' }
-          if ($env:EXTRA_FEATURE -eq 'fast-probe') { $patches += 'dark-pop-probe.patch'; $patches += 'fast-probe.patch' }
+          if ($env:EXTRA_FEATURE -eq 'contact-assist') { $patches += 'dark-pop-probe.patch'; $patches += 'fast-probe.patch'; $patches += 'contact-assist.patch'; $patches += 'probe-names-contact.patch' }
+          if ($env:EXTRA_FEATURE -eq 'fast-probe') { $patches += 'dark-pop-probe.patch'; $patches += 'fast-probe.patch'; $patches += 'probe-names.patch' }
           if ($env:EXTRA_FEATURE -eq 'menu-assist') { $patches += 'dark-pop-probe.patch'; $patches += 'menu-assist.patch' }
           foreach ($name in $patches) {
             $patch = Join-Path $env:GITHUB_WORKSPACE "mod/patches/$name"
@@ -115,6 +115,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "patches/$name is there but does not fit ReSkate $env:RESOLVED_REF. ReSkate changed a file the patch edits; the patch needs updating for this version." }
             git apply --ignore-whitespace $patch
             if ($LASTEXITCODE -ne 0) { throw "patches/$name failed to apply." }
+            Write-Host "Applied patches/$name"
+            "Applied patches/$name" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           }
 
       - name: Configure
@@ -122,7 +124,11 @@ jobs:
         # Crash reports stay on and go where ReSkate's go, labelled with this mod's name and version.
         working-directory: src
         run: |
-          $cmakeArgs = @('--preset', 'vs2022-x64', "-DDINGOSDK_VERSION=$env:BASE_VERSION", "-DDINGOSDK_MOD_ID=$env:MOD_NAME", "-DDINGOSDK_MOD_VERSION=$env:MOD_VERSION")
+          # The mod repository's commit goes after the version (0.2.1+abc1234), so the game's start-up notice and log
+          # say exactly which build is running, and it can be matched to a commit in this repository.
+          $commit = (git -C (Join-Path $env:GITHUB_WORKSPACE 'mod') rev-parse --short HEAD).Trim()
+          "Mod repository commit: $commit" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $cmakeArgs = @('--preset', 'vs2022-x64', "-DDINGOSDK_VERSION=$env:BASE_VERSION", "-DDINGOSDK_MOD_ID=$env:MOD_NAME", "-DDINGOSDK_MOD_VERSION=$env:MOD_VERSION+$commit")
           if ($env:PUBLISH -eq 'true') { $cmakeArgs += @('-DDINGOSDK_LAUNCHER_AUTO_UPDATE=ON', "-DDINGOSDK_RELEASE_REPO=${{ github.repository }}") }
           else { $cmakeArgs += '-DDINGOSDK_LAUNCHER_AUTO_UPDATE=OFF' }
           cmake @cmakeArgs
