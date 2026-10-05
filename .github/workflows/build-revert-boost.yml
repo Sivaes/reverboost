@@ -23,6 +23,7 @@ on:
           - none
           - dark-pop
           - probe
+          - menu-assist
         default: none
       publish:
         description: Publish a self-updating GitHub release (leave off for a zip to test or send to a friend)
@@ -88,7 +89,7 @@ jobs:
           "BASE_VERSION=$base" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "BASE_LABEL=$label" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           # A build with Dark Pop in it says so in its name, so crash reports and the log can tell the two apart.
-          $name = switch ($env:EXTRA_FEATURE) { 'dark-pop' { 'ReSkate_RevertBoost_DarkPop' } 'probe' { 'ReSkate_RevertBoost_Probe' } default { 'ReSkate_RevertBoost' } }
+          $name = switch ($env:EXTRA_FEATURE) { 'dark-pop' { 'ReSkate_RevertBoost_DarkPop' } 'probe' { 'ReSkate_RevertBoost_Probe' } 'menu-assist' { 'ReSkate_RevertBoost_MenuAssist' } default { 'ReSkate_RevertBoost' } }
           "MOD_NAME=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "ReSkate $label + Revert Boost $env:MOD_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
@@ -98,6 +99,7 @@ jobs:
           $patches = @('revert-boost.patch')
           if ($env:EXTRA_FEATURE -eq 'dark-pop') { $patches += 'dark-pop.patch' }
           if ($env:EXTRA_FEATURE -eq 'probe') { $patches += 'dark-pop-probe.patch' }
+          if ($env:EXTRA_FEATURE -eq 'menu-assist') { $patches += 'dark-pop-probe.patch'; $patches += 'menu-assist.patch' }
           foreach ($name in $patches) {
             $patch = Join-Path $env:GITHUB_WORKSPACE "mod/patches/$name"
             if (-not (Test-Path $patch)) {
